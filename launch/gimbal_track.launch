@@ -1,0 +1,10 @@
+<launch>
+	
+  <node name="gimbal_track" pkg="gimbal_track" type="gimbal_track" output="screen" >
+  <remap from="point" to="/circle_tracker/robot_location"/>
+  <remap from="gimbal" to="/djiros/gimbal"/>
+  <remap from="imu" to="/djiros/imu"/>
+  <remap from="sonar_dis" to="/sonar/sonar_dis"/>
+  </node>
+
+</launch>
