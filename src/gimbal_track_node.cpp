@@ -4,9 +4,16 @@
 #include <sensor_msgs/Imu.h>
 #include <message_filters/subscriber.h>
 #include <eigen3/Eigen/Dense>
-#include "std_msgs/Int16MultiArray.h"
-#include  "sensor_msgs/Range.h"
-#include <geometry_msgs/Point32.h>
+#include <geometry_msgs/PointStamped.h>
+#include <sensor_msgs/Range.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <iostream>
+#include <queue>
+#include <vector>
+#include <string>
+#include <sstream>//for int to string
+
+using namespace std;
 
 #define C_PI ((double) 3.141592653)
 #define CAMERA_FX 367.950989
@@ -28,6 +35,8 @@ ros::Publisher gimbal_ctrl_pub,robot_location_pub;
 bool drone_yaw_updated = false, gimbal_updated = false, sonar_updated = false;
 bool init_ok = false;
 Eigen::Vector3f pos_robot;
+float vx,vy;
+queue<geometry_msgs::PoseStamped> robot_pose_buf;
 
 Eigen::Vector3f vector_rotation_by_quaternion(Eigen::Vector3f init_vector, quaternion_data_t rotation)
 {
@@ -115,7 +124,7 @@ void gimbal_track(int u, int v)
         gimbal_ctrl_pub.publish(gimbal_ctrl_msg);
 }
 
-void robot_pos_estimator(int u, int v)
+void robot_pos_estimator(const geometry_msgs::PointStamped::ConstPtr& point_msg)
 {
     //if((!drone_yaw_updated) || (!gimbal_updated) || (!sonar_updated))
     //    break;
@@ -134,14 +143,58 @@ void robot_pos_estimator(int u, int v)
           0, cos(roll),  sin(roll),
           0, -sin(roll), cos(roll);
     R_camera = Rr * Rp * Ry;
-    p_norm << (float)-u/CAMERA_FY,
-              (float)v/CAMERA_FX,
+    p_norm << (float)-point_msg->point.x/CAMERA_FY,
+              (float)point_msg->point.y/CAMERA_FX,
                       1;
 
     float Zc = drone_height/(R_camera.transpose().row(2) * p_norm);  //camera depth
     
     pos_robot =  Zc * R_camera.transpose() * p_norm;
+    //smooth the pos
+    static bool pos_last_init = false;
+    static Eigen::Vector3f pos_robot_last;
+    if(!pos_last_init)
+    {
+        pos_last_init = true;
+        pos_robot_last = pos_robot;
+    }
+    else
+    {
+        pos_robot = 0.03*pos_robot + 0.97*pos_robot_last;
+        pos_robot_last = pos_robot;
+    }
+    geometry_msgs::PoseStamped robot_loc_msg;
     //printf("pos x = %.2f, y = %.2f, z = %.2f\n",pos_robot(0),pos_robot(1),pos_robot(2));
+    robot_loc_msg.pose.position.x = pos_robot(0);
+    robot_loc_msg.pose.position.y = pos_robot(1);
+    robot_loc_msg.pose.position.z = pos_robot(2);
+    robot_loc_msg.header.stamp = point_msg->header.stamp;
+    robot_loc_msg.header.frame_id = "body";
+    robot_pose_buf.push(robot_loc_msg);
+    if(robot_pose_buf.size()>1)
+    {
+        float delta_x,delta_y,delta_time;
+        delta_x = robot_pose_buf.back().pose.position.x - robot_pose_buf.front().pose.position.x;
+        delta_y = robot_pose_buf.back().pose.position.y - robot_pose_buf.front().pose.position.y;
+        delta_time = (robot_pose_buf.back().header.stamp - robot_pose_buf.front().header.stamp).toSec();
+        if(delta_time>=0.5)
+        {
+            vx = delta_x/delta_time;
+            vy = delta_y/delta_time;
+            //
+            //printf("size = %d, delta_time = %.2f\n",robot_pose_buf.size(),delta_time);
+            robot_pose_buf.pop();
+            robot_pose_buf.pop();
+            float direction = atan2(vy,vx);
+            robot_loc_msg.pose.orientation.x = 0;
+            robot_loc_msg.pose.orientation.y = 0;
+            robot_loc_msg.pose.orientation.z = sin(direction/2.0);
+            robot_loc_msg.pose.orientation.x = cos(direction/2.0);
+        }
+        printf("vx = %.2f, vy = %.2f\n",vx,vy);
+        printf("size = %d, delta_time = %.2f\n",robot_pose_buf.size(),delta_time);
+    }
+    robot_location_pub.publish(robot_loc_msg);
 }
 
 void droneImuCallback(const sensor_msgs::Imu::ConstPtr& msg)
@@ -165,10 +218,10 @@ void gimbalCallback(const geometry_msgs::Vector3Stamped::ConstPtr& msg)
   gimbal_updated = true;
 }
 
-void pointTrackCallback(const std_msgs::Int16MultiArray::ConstPtr& array)
+void pointTrackCallback(const geometry_msgs::PointStamped::ConstPtr& msg)
 {
-    gimbal_track(array->data[0],array->data[1]);
-    robot_pos_estimator(array->data[0], array->data[1]);
+    gimbal_track(msg->point.x,msg->point.y);
+    robot_pos_estimator(msg);
 }
 
 void sonarDisCallback(const sensor_msgs::Range::ConstPtr& msg)
@@ -188,11 +241,11 @@ void process()
     {
         printf("waiting fot gimbal msg\n");
     }
-    else if((fabs(pitch)>0.08 || fabs(roll)>0.08 || fabs(yaw)>0.08)&&init_ok == false)
+    else if((fabs(pitch+C_PI/3.0)>0.08 || fabs(roll)>0.08 || fabs(yaw)>0.08)&&init_ok == false)
     {
         //printf("pitch = %.2f, roll = %.2f, yaw = %.2f\n",pitch*180.0/C_PI,roll*180.0/C_PI,yaw*180.0/C_PI); 
         printf("initing\n");
-        gimbal_ctrl_msg.twist.angular.y = 1.0*(pitch);
+        gimbal_ctrl_msg.twist.angular.y = 1.0*(pitch+C_PI/3.0);
         gimbal_ctrl_msg.twist.angular.x = 1.0*(-roll);
         gimbal_ctrl_msg.twist.angular.z = 1.0*(yaw);
         gimbal_ctrl_pub.publish(gimbal_ctrl_msg);
@@ -201,11 +254,6 @@ void process()
     {
         init_ok = true;
         //printf("init ok\n");
-        geometry_msgs::Point32 robot_loc_msg;
-        robot_loc_msg.x = pos_robot(0);
-        robot_loc_msg.y = pos_robot(1);
-        robot_loc_msg.z = pos_robot(2);
-        robot_location_pub.publish(robot_loc_msg);
     }
 }
 
@@ -223,7 +271,7 @@ int main(int argc, char **argv)
     sub_sonar = n.subscribe("sonar_dis", 10, sonarDisCallback);
 
     gimbal_ctrl_pub = n.advertise<geometry_msgs::TwistStamped>("/djiros/gimbal_speed_ctrl", 10);
-    robot_location_pub = n.advertise<geometry_msgs::Point32>("/gimbal_track/robot_pose", 10);
+    robot_location_pub = n.advertise<geometry_msgs::PoseStamped>("/gimbal_track/robot_pose", 10);
 
     ros::Rate r(100);
     while (ros::ok())
