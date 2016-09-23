@@ -7,6 +7,8 @@
 #include <geometry_msgs/PointStamped.h>
 #include <sensor_msgs/Range.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/Odometry.h>
+#include <std_msgs/Float32.h>
 #include <iostream>
 #include <queue>
 #include <vector>
@@ -18,7 +20,7 @@ using namespace std;
 #define C_PI ((double) 3.141592653)
 #define CAMERA_FX 367.950989
 #define CAMERA_FY 362.819244
-
+#define WORLD_FRAME 1
 typedef struct
 {
     float w;
@@ -31,11 +33,16 @@ float drone_yaw = 0.0;
 float pitch=0,roll=0,yaw=0;
 float drone_height;
 quaternion_data_t rotation;  //current gimbal att
-ros::Publisher gimbal_ctrl_pub,robot_location_pub;
-bool drone_yaw_updated = false, gimbal_updated = false, sonar_updated = false;
+ros::Publisher gimbal_ctrl_pub,robot_location_pub,debug_pub;
+bool drone_yaw_updated = false, gimbal_updated = false, sonar_updated = false, odom_updated = false;
 bool init_ok = false;
-Eigen::Vector3f pos_robot;
-float vx,vy;
+Eigen::Vector3f pos_robot,drone_position;
+float drone_orientation;
+float vx = 0,vy = 0;
+int detect_num;
+int searching_flag = 1;
+int searching_flag2 = 1;
+bool in_searching = false;
 queue<geometry_msgs::PoseStamped> robot_pose_buf;
 
 Eigen::Vector3f vector_rotation_by_quaternion(Eigen::Vector3f init_vector, quaternion_data_t rotation)
@@ -107,10 +114,12 @@ void gimbal_track(int u, int v)
     desire_pitch_last = desire_pitch;
     desire_roll_last = desire_roll;
     desire_yaw_last = desire_yaw;
-    if(yaw>0.3&&gimbal_ctrl_msg.twist.angular.z<0)
+    if(yaw>0.5&&gimbal_ctrl_msg.twist.angular.z<0)
         gimbal_ctrl_msg.twist.angular.z = 0;
-    if(yaw<-0.3&&gimbal_ctrl_msg.twist.angular.z>0)
+    if(yaw<-0.5&&gimbal_ctrl_msg.twist.angular.z>0)
         gimbal_ctrl_msg.twist.angular.z = 0;
+    if(pitch>-C_PI/6.0&&gimbal_ctrl_msg.twist.angular.y<0)
+        gimbal_ctrl_msg.twist.angular.y = 0;
     //printf("gimbal_yaw: = %.2f\n",yaw);
     
     gimbal_ctrl_msg.twist.angular.y = 0.2 * gimbal_ctrl_msg.twist.angular.y + 0.8 * angular_y_last;
@@ -119,7 +128,7 @@ void gimbal_track(int u, int v)
     angular_y_last = gimbal_ctrl_msg.twist.angular.y;
     angular_x_last = gimbal_ctrl_msg.twist.angular.x;
     angular_z_last = gimbal_ctrl_msg.twist.angular.z;
-    
+    gimbal_ctrl_msg.twist.angular.z = 0;
     if(init_ok)
         gimbal_ctrl_pub.publish(gimbal_ctrl_msg);
 }
@@ -146,31 +155,44 @@ void robot_pos_estimator(const geometry_msgs::PointStamped::ConstPtr& point_msg)
     p_norm << (float)-point_msg->point.x/CAMERA_FY,
               (float)point_msg->point.y/CAMERA_FX,
                       1;
-
     float Zc = drone_height/(R_camera.transpose().row(2) * p_norm);  //camera depth
     
     pos_robot =  Zc * R_camera.transpose() * p_norm;
-    //smooth the pos
-    static bool pos_last_init = false;
-    static Eigen::Vector3f pos_robot_last;
-    if(!pos_last_init)
+    //printf("pos x = %.2f, y = %.2f drone_yaw = %.2f\n",pos_robot(0),pos_robot(1),drone_orientation*180.0/C_PI);
+    geometry_msgs::PoseStamped robot_loc_msg;
+    if(odom_updated == true)
     {
-        pos_last_init = true;
-        pos_robot_last = pos_robot;
+        robot_loc_msg.header.frame_id = "world";
+        robot_loc_msg.pose.position.x = pos_robot(0)*cos(drone_orientation) + pos_robot(1)*sin(drone_orientation) + drone_position(0);
+        robot_loc_msg.pose.position.y = pos_robot(0)*sin(drone_orientation) - pos_robot(1)*cos(drone_orientation) + drone_position(1);
     }
     else
     {
-        pos_robot = 0.03*pos_robot + 0.97*pos_robot_last;
-        pos_robot_last = pos_robot;
+        robot_loc_msg.header.frame_id = "body";
+        robot_loc_msg.pose.position.x = pos_robot(0);
+        robot_loc_msg.pose.position.y = -pos_robot(1);
     }
-    geometry_msgs::PoseStamped robot_loc_msg;
-    //printf("pos x = %.2f, y = %.2f, z = %.2f\n",pos_robot(0),pos_robot(1),pos_robot(2));
-    robot_loc_msg.pose.position.x = pos_robot(0);
-    robot_loc_msg.pose.position.y = pos_robot(1);
-    robot_loc_msg.pose.position.z = pos_robot(2);
+    //smooth the pos
+    static bool pos_last_init = false;
+    static float robot_pos_x_last,robot_pos_y_last;
+    static int last_detect_num = 0;
+    if(!pos_last_init)
+    {
+        pos_last_init = true;
+        robot_pos_x_last = robot_loc_msg.pose.position.x;
+        robot_pos_y_last = robot_loc_msg.pose.position.y;
+    }
+    else
+    {
+        robot_loc_msg.pose.position.x = 0.03*robot_loc_msg.pose.position.x + 0.97*robot_pos_x_last;
+        robot_loc_msg.pose.position.y = 0.03*robot_loc_msg.pose.position.y + 0.97*robot_pos_y_last;
+        robot_pos_x_last = robot_loc_msg.pose.position.x;
+        robot_pos_y_last = robot_loc_msg.pose.position.y;
+    }
+    robot_loc_msg.pose.position.z = -1; 
     robot_loc_msg.header.stamp = point_msg->header.stamp;
-    robot_loc_msg.header.frame_id = "body";
     robot_pose_buf.push(robot_loc_msg);
+    float direction = 0;
     if(robot_pose_buf.size()>1)
     {
         float delta_x,delta_y,delta_time;
@@ -181,19 +203,47 @@ void robot_pos_estimator(const geometry_msgs::PointStamped::ConstPtr& point_msg)
         {
             vx = delta_x/delta_time;
             vy = delta_y/delta_time;
-            //
+            vx = fabs(vx)<0.05? 0:vx;
+            vy = fabs(vy)<0.05? 0:vy;
             //printf("size = %d, delta_time = %.2f\n",robot_pose_buf.size(),delta_time);
             robot_pose_buf.pop();
             robot_pose_buf.pop();
-            float direction = atan2(vy,vx);
-            robot_loc_msg.pose.orientation.x = 0;
-            robot_loc_msg.pose.orientation.y = 0;
-            robot_loc_msg.pose.orientation.z = sin(direction/2.0);
-            robot_loc_msg.pose.orientation.x = cos(direction/2.0);
+            last_detect_num = point_msg->point.z;
         }
-        printf("vx = %.2f, vy = %.2f\n",vx,vy);
-        printf("size = %d, delta_time = %.2f\n",robot_pose_buf.size(),delta_time);
+        else if(last_detect_num == 0)
+        {
+            //detect, but wait about 1s to calculate vel
+            vx = 0;
+            vy = 0;
+            robot_loc_msg.pose.position.z = -1;
+        }
+        direction = atan2(vy,vx);
+        std_msgs::Float32 debug_msg;
+        debug_msg.data = direction*180.0/C_PI;
+        debug_pub.publish(debug_msg);
+        robot_loc_msg.pose.orientation.x = 0;
+        robot_loc_msg.pose.orientation.y = 0;
+        robot_loc_msg.pose.orientation.z = sin(direction/2.0);
+        robot_loc_msg.pose.orientation.w = cos(direction/2.0);
+        //printf("vx = %.2f, vy = %.2f, direction = %.2f\n",vx,vy,direction*180.0/C_PI);
+
+        if(point_msg->point.z > 0)
+            robot_loc_msg.pose.position.z = sqrt(vx*vx + vy*vy);
+        else
+        {
+            //lost
+            robot_loc_msg.pose.position.z = -1;   
+            last_detect_num = 0;
+            while(!robot_pose_buf.empty()) robot_pose_buf.pop();    
+        }
+        
     }
+    //printf("pos x = %.2f, y = %.2f\n",pos_robot(0),pos_robot(1));
+    //printf("drone: x = %.2f, y = %.2f\n",drone_position(0),drone_position(1));
+    printf("x = %.2f, y = %.2f, z = %.2f, direction = %.2f\n",robot_loc_msg.pose.position.x,
+                                                             robot_loc_msg.pose.position.y,
+                                                             robot_loc_msg.pose.position.z,
+                                                             direction*180.0/C_PI);
     robot_location_pub.publish(robot_loc_msg);
 }
 
@@ -222,14 +272,32 @@ void pointTrackCallback(const geometry_msgs::PointStamped::ConstPtr& msg)
 {
     gimbal_track(msg->point.x,msg->point.y);
     robot_pos_estimator(msg);
+    detect_num = (int)msg->point.z;
+    if(detect_num == 0)
+    {
+        init_ok = false;
+    }
+        
 }
 
 void sonarDisCallback(const sensor_msgs::Range::ConstPtr& msg)
 {
     static float height_last = 0;
-    drone_height = 0.1 * msg->range + 0.9 * height_last;
+    //drone_height = 0.1 * msg->range + 0.9 * height_last;
     height_last = drone_height;
     sonar_updated = true;
+    printf("height = %.2f\n",drone_height);
+}
+void odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
+{
+    drone_position << msg->pose.pose.position.x,
+                      msg->pose.pose.position.y,
+                      msg->pose.pose.position.z;
+    drone_height =  msg->pose.pose.position.z;
+    drone_orientation = atan2(2.0*(msg->pose.pose.orientation.w*msg->pose.pose.orientation.z + msg->pose.pose.orientation.x*msg->pose.pose.orientation.y),
+                          -1.0 + 2.0*(msg->pose.pose.orientation.w*msg->pose.pose.orientation.w + msg->pose.pose.orientation.x*msg->pose.pose.orientation.x)); 
+    //printf("drone: x = %.2f, y = %.2f z = %.2f, yaw = %.2f\n",drone_position(0),drone_position(1),drone_position(2),drone_orientation*180.0/C_PI);  
+    odom_updated = true;              
 }
 
 void process()
@@ -241,11 +309,11 @@ void process()
     {
         printf("waiting fot gimbal msg\n");
     }
-    else if((fabs(pitch+C_PI/3.0)>0.08 || fabs(roll)>0.08 || fabs(yaw)>0.08)&&init_ok == false)
+    else if((fabs(pitch+C_PI/4.0)>0.08 || fabs(roll)>0.08 || fabs(yaw)>0.08)&&init_ok == false&&in_searching==false)
     {
         //printf("pitch = %.2f, roll = %.2f, yaw = %.2f\n",pitch*180.0/C_PI,roll*180.0/C_PI,yaw*180.0/C_PI); 
-        printf("initing\n");
-        gimbal_ctrl_msg.twist.angular.y = 1.0*(pitch+C_PI/3.0);
+        //printf("initing\n");
+        gimbal_ctrl_msg.twist.angular.y = 1.0*(pitch+C_PI/4.0);
         gimbal_ctrl_msg.twist.angular.x = 1.0*(-roll);
         gimbal_ctrl_msg.twist.angular.z = 1.0*(yaw);
         gimbal_ctrl_pub.publish(gimbal_ctrl_msg);
@@ -253,7 +321,59 @@ void process()
     else
     {
         init_ok = true;
+        if(detect_num == 0)
+            in_searching = true;
+        else
+            in_searching = false;
         //printf("init ok\n");
+    }
+    //init ok but not detect target
+    if(in_searching == true)
+    {
+        //printf("searching\n");
+        geometry_msgs::TwistStamped gimbal_ctrl_msg_for_search;
+        
+        //yaw searching
+        /*
+        if(searching_flag == 1)
+        {
+            gimbal_ctrl_msg_for_search.twist.angular.z = 0.3;
+            if(yaw<-0.3)
+            {
+                searching_flag = -1;
+                gimbal_ctrl_msg_for_search.twist.angular.z = 0;
+            }
+        }
+        else if(searching_flag == -1)
+        {
+            gimbal_ctrl_msg_for_search.twist.angular.z = -0.3;
+            if(yaw>0.3)
+            {
+                searching_flag = 1;
+                gimbal_ctrl_msg_for_search.twist.angular.z = 0;
+            }
+        }
+        */
+        //pitch searching
+        if(searching_flag2 == 1)
+        {
+            gimbal_ctrl_msg_for_search.twist.angular.y = 0.3;
+            if(pitch <-C_PI/3.0)
+            {
+                searching_flag2 = -1;
+                gimbal_ctrl_msg_for_search.twist.angular.y = 0;
+            }
+        }
+        else if(searching_flag2 == -1)
+        {
+            gimbal_ctrl_msg_for_search.twist.angular.y = -0.3;
+            if(pitch>-C_PI/6.0)
+            {
+                searching_flag2 = 1;
+                gimbal_ctrl_msg_for_search.twist.angular.y = 0;
+            }
+        }
+        gimbal_ctrl_pub.publish(gimbal_ctrl_msg_for_search);
     }
 }
 
@@ -262,16 +382,18 @@ int main(int argc, char **argv)
 {
     ros::init(argc, argv, "circle_tracker");
     ros::NodeHandle n;
-    ros::Subscriber sub_gimbal,sub_imu,sub_point,sub_sonar;
+    ros::Subscriber sub_gimbal,sub_imu,sub_point,sub_sonar,sub_odom;
     ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Debug);
 
     sub_gimbal = n.subscribe("gimbal", 10, gimbalCallback);
     sub_imu = n.subscribe("imu", 50, droneImuCallback);
     sub_point = n.subscribe("point", 10, pointTrackCallback);
     sub_sonar = n.subscribe("sonar_dis", 10, sonarDisCallback);
+    sub_odom = n.subscribe("odom", 10, odomCallback);
 
     gimbal_ctrl_pub = n.advertise<geometry_msgs::TwistStamped>("/djiros/gimbal_speed_ctrl", 10);
-    robot_location_pub = n.advertise<geometry_msgs::PoseStamped>("/gimbal_track/robot_pose", 10);
+    robot_location_pub = n.advertise<geometry_msgs::PoseStamped>("robot_pose", 10);
+    debug_pub = n.advertise<std_msgs::Float32>("/gimbal_track/debug", 10);
 
     ros::Rate r(100);
     while (ros::ok())

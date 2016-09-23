@@ -1,10 +1,54 @@
 <launch>
-	
+  
+  <node name="circle_tracker" pkg="circle_tracker" type="circle_tracker">
+
+   	<param name="need_publish_image" type="bool" value="true" />
+
+                <param name="red_H_low1" type="int" value="0" />
+        <param name="red_S_low1" type="int" value="100" />
+        <param name="red_V_low1" type="int" value="120" />
+        <param name="red_H_high1" type="int" value="10" />
+        <param name="red_S_high1" type="int" value="255" />
+        <param name="red_V_high1" type="int" value="255" />
+        <param name="red_H_low2" type="int" value="175" />
+        <param name="red_S_low2" type="int" value="100" />
+        <param name="red_V_low2" type="int" value="120" />
+        <param name="red_H_high2" type="int" value="180" />
+        <param name="red_S_high2" type="int" value="255" />
+        <param name="red_V_high2" type="int" value="255" />
+
+        <param name="green_H_low" type="int" value="50" />
+        <param name="green_S_low" type="int" value="50" />
+        <param name="green_V_low" type="int" value="50" />
+        <param name="green_H_high" type="int" value="70" />
+        <param name="green_S_high" type="int" value="255" />
+        <param name="green_V_high" type="int" value="255" />
+
+        <param name="background_H_low" type="int" value="90" />
+        <param name="background_S_low" type="int" value="0" />
+        <param name="background_V_low" type="int" value="70" />
+        <param name="background_H_high" type="int" value="120" />
+        <param name="background_S_high" type="int" value="100" />
+        <param name="background_V_high" type="int" value="255" />
+
+        <param name="background_H_low2" type="int" value="0" />
+        <param name="background_S_low2" type="int" value="0" />
+        <param name="background_V_low2" type="int" value="70" />
+        <param name="background_H_high2" type="int" value="0" />
+        <param name="background_S_high2" type="int" value="100" />
+        <param name="background_V_high2" type="int" value="255" />
+
+
+  <remap from="raw_image" to="/m100_x3/image_raw"/>
+  </node>
+
   <node name="gimbal_track" pkg="gimbal_track" type="gimbal_track" output="screen" >
   <remap from="point" to="/circle_tracker/robot_location"/>
+  <remap from="odom" to="/odom"/>
+  <remap from="robot_pose" to="/target_irobot"/>
   <remap from="gimbal" to="/djiros/gimbal"/>
   <remap from="imu" to="/djiros/imu"/>
-  <remap from="sonar_dis" to="/sonar/sonar_dis"/>
+  <remap from="sonar_dis" to="/sonar/sonar_height"/>
   </node>
 
 </launch>
